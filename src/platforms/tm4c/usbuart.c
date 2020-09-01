@@ -42,59 +42,64 @@ void usbuart_init(void)
 {
 	UART_PIN_SETUP();
 	
-	periph_clock_enable(USBUART_CLK);
+	periph_clock_enable(USBUSART_CLK);
 	__asm__("nop"); __asm__("nop"); __asm__("nop");
 	
-	uart_disable(USBUART);
+	uart_disable(USBUSART);
 
 	/* Setup UART parameters. */
-	uart_clock_from_sysclk(USBUART);
-	uart_set_baudrate(USBUART, 38400);
-	uart_set_databits(USBUART, 8);
-	uart_set_stopbits(USBUART, 1);
-	uart_set_parity(USBUART, UART_PARITY_NONE);
+	uart_clock_from_sysclk(USBUSART);
+	uart_set_baudrate(USBUSART, 38400);
+	uart_set_databits(USBUSART, 8);
+	uart_set_stopbits(USBUSART, 1);
+	uart_set_parity(USBUSART, UART_PARITY_NONE);
 
 	// Enable FIFO
-	uart_enable_fifo(USBUART);
+	uart_enable_fifo(USBUSART);
 
 	// Set FIFO interrupt trigger levels to 1/8 full for RX buffer and
 	// 7/8 empty (1/8 full) for TX buffer
-	uart_set_fifo_trigger_levels(USBUART, UART_FIFO_RX_TRIG_1_8, UART_FIFO_TX_TRIG_7_8);
+	uart_set_fifo_trigger_levels(USBUSART, UART_FIFO_RX_TRIG_1_8, UART_FIFO_TX_TRIG_7_8);
 
-	uart_clear_interrupt_flag(USBUART, UART_INT_RX | UART_INT_RT);
+	uart_clear_interrupt_flag(USBUSART, UART_INT_RX | UART_INT_RT);
 
 	/* Enable interrupts */
-	uart_enable_interrupts(UART0, UART_INT_RX| UART_INT_RT);
+	uart_enable_interrupts(USBUSART, UART_INT_RX | UART_INT_RT);
 
 	/* Finally enable the USART. */
-	uart_enable(USBUART);
+	uart_enable(USBUSART);
 
-	//nvic_set_priority(USBUSART_IRQ, IRQ_PRI_USBUSART);
-	nvic_enable_irq(USBUART_IRQ);
+	nvic_set_priority(USBUSART_IRQ, IRQ_PRI_USBUSART);
+	nvic_enable_irq(USBUSART_IRQ);
 }
 
 void usbuart_set_line_coding(struct usb_cdc_line_coding *coding)
 {
-	uart_set_baudrate(USBUART, coding->dwDTERate);
-	uart_set_databits(USBUART, coding->bDataBits);
+	uart_set_baudrate(USBUSART, coding->dwDTERate);
+
+	if (coding->bParityType)
+		uart_set_databits(USBUSART, coding->bDataBits + 1);
+	else
+		uart_set_databits(USBUSART, coding->bDataBits);
+
 	switch(coding->bCharFormat) {
 	case 0:
 	case 1:
-		uart_set_stopbits(USBUART, 1);
+		uart_set_stopbits(USBUSART, 1);
 		break;
 	case 2:
-		uart_set_stopbits(USBUART, 2);
+		uart_set_stopbits(USBUSART, 2);
 		break;
 	}
 	switch(coding->bParityType) {
 	case 0:
-		uart_set_parity(USBUART, UART_PARITY_NONE);
+		uart_set_parity(USBUSART, UART_PARITY_NONE);
 		break;
 	case 1:
-		uart_set_parity(USBUART, UART_PARITY_ODD);
+		uart_set_parity(USBUSART, UART_PARITY_ODD);
 		break;
 	case 2:
-		uart_set_parity(USBUART, UART_PARITY_EVEN);
+		uart_set_parity(USBUSART, UART_PARITY_EVEN);
 		break;
 	}
 }
@@ -108,7 +113,7 @@ void usbuart_usb_out_cb(usbd_device *dev, uint8_t ep)
 					buf, CDCACM_PACKET_SIZE);
 
 	for(int i = 0; i < len; i++)
-		uart_send_blocking(USBUART, buf[i]);
+		uart_send_blocking(USBUSART, buf[i]);
 }
 
 
@@ -123,12 +128,12 @@ void usbuart_usb_in_cb(usbd_device *dev, uint8_t ep)
  * Allowed to read from FIFO out pointer, but not write to it.
  * Allowed to write to FIFO in pointer.
  */
-void USBUART_ISR(void)
+void USBUSART_ISR(void)
 {
-	int flush = uart_is_interrupt_source(USBUART, UART_INT_RT);
+	int flush = uart_is_interrupt_source(USBUSART, UART_INT_RT);
 
-	while (!uart_is_rx_fifo_empty(USBUART)) {
-		char c = uart_recv(USBUART);
+	while (!uart_is_rx_fifo_empty(USBUSART)) {
+		char c = uart_recv(USBUSART);
 
 		/* If the next increment of rx_in would put it at the same point
 		* as rx_out, the FIFO is considered full.
