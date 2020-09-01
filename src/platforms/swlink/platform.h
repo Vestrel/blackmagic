@@ -96,11 +96,10 @@ int usbuart_debug_write(const char *buf, size_t len);
 #define USB_IRQ         NVIC_USB_LP_CAN_RX0_IRQ
 #define USB_ISR         usb_lp_can_rx0_isr
 /* Interrupt priorities.  Low numbers are high priority.
- * For now USART1 preempts USB which may spin while buffer is drained.
  * TIM2 is used for traceswo capture and must be highest priority.
  */
-#define IRQ_PRI_USB		(2 << 4)
-#define IRQ_PRI_USBUSART	(1 << 4)
+#define IRQ_PRI_USB		(1 << 4)
+#define IRQ_PRI_USBUSART	(2 << 4)
 #define IRQ_PRI_USBUSART_TIM	(3 << 4)
 #define IRQ_PRI_USB_VBUS	(14 << 4)
 #define IRQ_PRI_SWO_DMA		(0 << 4)
