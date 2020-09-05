@@ -23,6 +23,7 @@
 #include <libopencm3/stm32/gpio.h>
 #include <libopencm3/stm32/usart.h>
 #include <libopencm3/stm32/timer.h>
+#include <libopencm3/stm32/dma.h>
 #include <libopencm3/cm3/nvic.h>
 #include <libopencm3/cm3/scs.h>
 #include <libopencm3/usb/usbd.h>
@@ -36,14 +37,16 @@
 
 #define RX_FIFO_SIZE 128
 
-#define TX_FIFO_SIZE 128
+#define TX_BUF_SIZE 128
 
-/* TX FIFO buffer */
-static uint8_t buf_tx[TX_FIFO_SIZE];
-/* FIFO in pointer, writes assumed to be atomic, should be only incremented outside TX ISR */
-static uint8_t buf_tx_in;
-/* FIFO out pointer, writes assumed to be atomic, should be only incremented within TX ISR */
-static uint8_t buf_tx_out;
+/* TX double buffer */
+static uint8_t buf_tx[TX_BUF_SIZE * 2];
+/* Active buffer part idx */
+static uint8_t buf_tx_act_idx;
+/* Active buffer part used capacity */
+static uint8_t buf_tx_act_sz;
+/* TX transfer complete */
+static bool tx_trfr_cplt = true;
 /* RX Fifo buffer */
 static uint8_t buf_rx[RX_FIFO_SIZE];
 /* Fifo in pointer, writes assumed to be atomic, should be only incremented within RX ISR */
@@ -56,6 +59,7 @@ static void usbuart_run(void);
 void usbuart_init(void)
 {
 	rcc_periph_clock_enable(USBUSART_CLK);
+	rcc_periph_clock_enable(USBUSART_DMA_CLK);
 
 	UART_PIN_SETUP();
 
@@ -66,14 +70,17 @@ void usbuart_init(void)
 	usart_set_mode(USBUSART, USART_MODE_TX_RX);
 	usart_set_parity(USBUSART, USART_PARITY_NONE);
 	usart_set_flow_control(USBUSART, USART_FLOWCONTROL_NONE);
-
-	/* Enable interrupts */
 	USBUSART_CR1 |= USART_CR1_RXNEIE;
-	nvic_set_priority(USBUSART_IRQ, IRQ_PRI_USBUSART);
-	nvic_enable_irq(USBUSART_IRQ);
 
-	/* Finally enable the USART. */
-	usart_enable(USBUSART);
+	/* Setup USART TX DMA */
+	dma_channel_reset(USBUSART_DMA_BUS, USBUSART_DMA_TX_CHAN);
+	dma_set_peripheral_address(USBUSART_DMA_BUS, USBUSART_DMA_TX_CHAN, (uint32_t)&USBUSART_DR);
+	dma_set_read_from_memory(USBUSART_DMA_BUS, USBUSART_DMA_TX_CHAN);
+	dma_enable_memory_increment_mode(USBUSART_DMA_BUS, USBUSART_DMA_TX_CHAN);
+	dma_set_peripheral_size(USBUSART_DMA_BUS, USBUSART_DMA_TX_CHAN, DMA_CCR_PSIZE_8BIT);
+	dma_set_memory_size(USBUSART_DMA_BUS, USBUSART_DMA_TX_CHAN, DMA_CCR_MSIZE_8BIT);
+	dma_set_priority(USBUSART_DMA_BUS, USBUSART_DMA_TX_CHAN, DMA_CCR_PL_HIGH);
+	dma_enable_transfer_complete_interrupt(USBUSART_DMA_BUS, USBUSART_DMA_TX_CHAN);
 
 	/* Setup timer for running deferred FIFO processing */
 	USBUSART_TIM_CLK_EN();
@@ -84,9 +91,17 @@ void usbuart_init(void)
 	timer_set_period(USBUSART_TIM,
 			USBUART_TIMER_FREQ_HZ / USBUART_RUN_FREQ_HZ - 1);
 
-	/* Setup update interrupt in NVIC */
+	/* Enable interrupts */
+	nvic_set_priority(USBUSART_IRQ, IRQ_PRI_USBUSART);
+	nvic_set_priority(USBUSART_DMA_TX_IRQ, IRQ_PRI_USBUSART_DMA);
 	nvic_set_priority(USBUSART_TIM_IRQ, IRQ_PRI_USBUSART_TIM);
+	nvic_enable_irq(USBUSART_IRQ);
+	nvic_enable_irq(USBUSART_DMA_TX_IRQ);
 	nvic_enable_irq(USBUSART_TIM_IRQ);
+
+	/* Finally enable the USART. */
+	usart_enable(USBUSART);
+	usart_enable_tx_dma(USBUSART);	
 
 	/* turn the timer on */
 	timer_enable_counter(USBUSART_TIM);
@@ -172,14 +187,33 @@ void usbuart_set_line_coding(struct usb_cdc_line_coding *coding)
 	}
 }
 
+/* 
+ * Changes USBUSART TX buffer in which data is accumulated from USB.
+ * Filled buffer is submitted to DMA for transfer.
+ */
+static void usbusart_change_dma_tx_buf(void)
+{
+	/* Select buffer for transmission */
+	uint8_t *const tx_buf_ptr = &buf_tx[buf_tx_act_idx * TX_BUF_SIZE];
+
+	/* Configure DMA */
+	dma_set_memory_address(USBUSART_DMA_BUS, USBUSART_DMA_TX_CHAN, (uint32_t)tx_buf_ptr);
+	dma_set_number_of_data(USBUSART_DMA_BUS, USBUSART_DMA_TX_CHAN, buf_tx_act_sz);
+	dma_enable_channel(USBUSART_DMA_BUS, USBUSART_DMA_TX_CHAN);
+
+	/* Change active buffer */
+	buf_tx_act_sz = 0;
+	buf_tx_act_idx ^= 1;
+}
+
 void usbuart_usb_out_cb(usbd_device *dev, uint8_t ep)
 {
 	(void)ep;
 
 	usbd_ep_nak_set(dev, CDCACM_UART_ENDPOINT, 1);
-	char buf[CDCACM_PACKET_SIZE];
+	uint8_t *const tx_buf_ptr = &buf_tx[buf_tx_act_idx * TX_BUF_SIZE];
 	const uint16_t len = usbd_ep_read_packet(dev, CDCACM_UART_ENDPOINT,
-						buf, CDCACM_PACKET_SIZE);
+						tx_buf_ptr + buf_tx_act_sz, CDCACM_PACKET_SIZE);
 
 #if defined(BLACKMAGIC)
 	/* Don't bother if uart is disabled.
@@ -194,24 +228,21 @@ void usbuart_usb_out_cb(usbd_device *dev, uint8_t ep)
 
 	if (len)
 	{
-		uint16_t copy_idx = 0;
+		buf_tx_act_sz += len;
 
-		/* copy data to TX FIFO */
-		while (copy_idx < len)
+		/* If DMA is idle, schedule new transfer */
+		if (tx_trfr_cplt)
 		{
-			buf_tx[buf_tx_in++] = buf[copy_idx++];
+			usbusart_change_dma_tx_buf();
+			tx_trfr_cplt = false;
 
-			if (buf_tx_in >= TX_FIFO_SIZE)
-				buf_tx_in = 0;
+			/* Enable LED */
+			gpio_set(LED_PORT_UART, LED_UART);
 		}
-
-		/* enable UART TX IRQ and LED */
-		USBUSART_CR1 |= USART_CR1_TXEIE;
-		gpio_set(LED_PORT_UART, LED_UART);
 	}
 
-	/* enable USBUART TX packet reception if FIFO has enough space */
-	if (!len || (buf_tx_out - buf_tx_in) % TX_FIFO_SIZE > CDCACM_PACKET_SIZE)
+	/* Enable USBUART TX packet reception if buffer has enough space */
+	if (TX_BUF_SIZE - buf_tx_act_sz >= CDCACM_PACKET_SIZE)
 		usbd_ep_nak_set(dev, CDCACM_UART_ENDPOINT, 0);
 }
 
@@ -219,7 +250,7 @@ void usbuart_usb_out_cb(usbd_device *dev, uint8_t ep)
 int usbuart_debug_write(const char *buf, size_t len)
 {
 	cm_disable_interrupts();
-	for (size_t i = 0; i < len || (buf_rx_in + 1) % RX_FIFO_SIZE != buf_rx_out; i++) {
+	for (size_t i = 0; i < len && (buf_rx_in + 1) % RX_FIFO_SIZE != buf_rx_out; i++) {
 		if (buf[i] == '\n') {
 			buf_rx[buf_rx_in++] = '\r';
 			buf_rx_in %= RX_FIFO_SIZE;
@@ -244,33 +275,10 @@ void usbuart_usb_in_cb(usbd_device *dev, uint8_t ep)
  * Read a character from the UART RX and stuff it in a software RX FIFO.
  * Allowed to read from RX FIFO out pointer, but not write to it.
  * Allowed to write to RX FIFO in pointer.
- * Read a character from the TX FIFO and stuff it in a UART TX.
- * Allowed to read from TX FIFO in pointer, but not write to it.
- * Allowed to write to TX FIFO out pointer.
  */
 static void usbuart_service()
 {
 	const uint32_t status = USART_SR(USBUSART);
-
-	/* Send data to UART from TX FIFO */
-	if (status & USART_FLAG_TXE)
-	{
-		if (buf_tx_out != buf_tx_in)
-		{
-			usart_send(USBUSART, buf_tx[buf_tx_out]);
-			buf_tx_out = (buf_tx_out + 1) % TX_FIFO_SIZE;
-		}
-		else
-		{
-			/* no data left, disable IRQ and LED */
-			USBUSART_CR1 &= ~USART_CR1_TXEIE;
-			gpio_clear(LED_PORT_UART, LED_UART);
-		}
-		
-		/* enable USBUART TX packet reception if FIFO has enough space */
-		if (buf_tx_out == buf_tx_in || (buf_tx_out - buf_tx_in) % TX_FIFO_SIZE > CDCACM_PACKET_SIZE)
-			usbd_ep_nak_set(usbdev, CDCACM_UART_ENDPOINT, 0);
-	}
 
 	const char c = usart_recv(USBUSART);
 #if !defined(USART_SR_NE) && defined(USART_ISR_NF)
@@ -307,6 +315,30 @@ void USBUSART_ISR(void)
 	cm_disable_interrupts();
 	usbuart_service();
 	cm_enable_interrupts();
+}
+
+void USBUSART_DMA_TX_ISR(void)
+{
+	nvic_disable_irq(USB_IRQ);
+
+	/* Stop DMA */
+	dma_clear_interrupt_flags(USBUSART_DMA_BUS, USBUSART_DMA_TX_CHAN, DMA_IFCR_CTCIF_BIT);
+	dma_disable_channel(USBUSART_DMA_BUS, USBUSART_DMA_TX_CHAN);
+
+	/* If new buffer is ready, continue transmission.
+	 * Otherwise report transfer completion.
+	 */
+	if (buf_tx_act_sz)
+	{
+		usbusart_change_dma_tx_buf();
+		usbd_ep_nak_set(usbdev, CDCACM_UART_ENDPOINT, 0);
+	}
+	else
+	{
+		tx_trfr_cplt = true;
+		gpio_clear(LED_PORT_UART, LED_UART);
+	}
+	nvic_enable_irq(USB_IRQ);
 }
 
 void USBUSART_TIM_ISR(void)
