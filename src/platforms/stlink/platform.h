@@ -119,12 +119,15 @@ int usbuart_debug_write(const char *buf, size_t len);
 #define USBUSART_TIM TIM4
 #define USBUSART_TIM_CLK_EN() rcc_periph_clock_enable(RCC_TIM4)
 #define USBUSART_TIM_IRQ NVIC_TIM4_IRQ
-#define USBUSART_TIM_ISR tim4_isr
+#define USBUSART_TIM_ISR(x) tim4_isr(x)
 #define USBUSART_DMA_BUS DMA1
 #define USBUSART_DMA_CLK RCC_DMA1
 #define USBUSART_DMA_TX_CHAN DMA_CHANNEL7
 #define USBUSART_DMA_TX_IRQ NVIC_DMA1_CHANNEL7_IRQ
 #define USBUSART_DMA_TX_ISR(x) dma1_channel7_isr(x)
+#define USBUSART_DMA_RX_CHAN DMA_CHANNEL6
+#define USBUSART_DMA_RX_IRQ NVIC_DMA1_CHANNEL6_IRQ
+#define USBUSART_DMA_RX_ISR(x) dma1_channel6_isr(x)
 
 /* On F103, only USART1 is on AHB2 and can reach 4.5 MBaud at 72 MHz.*/
 #define SWO_UART				USART1
