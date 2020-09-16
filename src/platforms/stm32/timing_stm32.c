@@ -23,6 +23,8 @@
 #include <libopencm3/cm3/nvic.h>
 #include <libopencm3/stm32/rcc.h>
 
+#include <libopencm3/stm32/usart.h>
+
 uint8_t running_status;
 static volatile uint32_t time_ms;
 
@@ -51,6 +53,17 @@ void sys_tick_handler(void)
 		gpio_toggle(LED_PORT, LED_IDLE_RUN);
 
 	time_ms += 100;
+
+	if (time_ms % 30000 == 0) {
+		extern uint32_t canTX;
+		char buf[64] = {};
+		const uint32_t cnt = sprintf(buf, "%lu\n", canTX);
+
+		for (uint32_t idx = 0; idx < cnt; idx++) {
+			usart_wait_send_ready(USBUSART);
+			USBUSART_DR = buf[idx];
+		}
+	}
 
 	SET_ERROR_STATE(morse_update());
 }

@@ -18,15 +18,18 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <libopencm3/cm3/cortex.h>
 #include <libopencm3/stm32/rcc.h>
 #include <libopencm3/stm32/gpio.h>
 #include <libopencm3/stm32/usart.h>
 #include <libopencm3/stm32/dma.h>
+#include <libopencm3/cm3/cortex.h>
 #include <libopencm3/cm3/nvic.h>
 #include <libopencm3/cm3/scs.h>
 #include <libopencm3/usb/usbd.h>
 #include <libopencm3/usb/cdc.h>
+
+#include <libopencm3/cm3/dwt.h>
+#include <libopencm3/stm32/st_usbfs.h>
 
 #include "general.h"
 #include "cdcacm.h"
@@ -102,6 +105,8 @@ void usbuart_init(void)
 	usart_enable(USBUSART);
 	usart_enable_tx_dma(USBUSART);
 	usart_enable_rx_dma(USBUSART);
+
+	dwt_enable_cycle_counter();
 }
 
 void usbuart_set_line_coding(struct usb_cdc_line_coding *coding)
@@ -186,8 +191,8 @@ void usbuart_usb_out_cb(usbd_device *dev, uint8_t ep)
 		/* If DMA is idle, schedule new transfer */
 		if (tx_trfr_cplt)
 		{
-			usbusart_change_dma_tx_buf();
 			tx_trfr_cplt = false;
+			usbusart_change_dma_tx_buf();
 
 			/* Enable LED */
 			gpio_set(LED_PORT_UART, LED_UART);
@@ -218,6 +223,9 @@ int usbuart_debug_write(const char *buf, size_t len)
 }
 #endif
 
+uint32_t lastCycCnt = 0;
+uint32_t canTX = 0;
+
 /*
  * Runs deferred processing for USBUSART RX, draining RX FIFO by sending
  * characters to host PC via CDCACM. Allowed to write to FIFO OUT pointer.
@@ -239,6 +247,7 @@ static void usbusart_send_rx_packet(void)
 	}
 	else
 	{
+		lastCycCnt = dwt_read_cycle_counter();
 		/* To avoid the need of sending ZLP don't transmit full packet */
 		uint8_t packet_buf[CDCACM_PACKET_SIZE - 1];
 		uint32_t packet_size = 0;
@@ -250,6 +259,11 @@ static void usbusart_send_rx_packet(void)
 		/* advance fifo out pointer by amount written */
 		const uint16_t written = usbd_ep_write_packet(usbdev, CDCACM_UART_ENDPOINT, packet_buf, packet_size);
 		buf_rx_out = (buf_rx_out + written) % RX_FIFO_SIZE;
+		// canTX += written;
+
+		if (written) {
+			canTX++;
+		}
 	}
 }
 
@@ -264,6 +278,12 @@ void usbuart_usb_in_cb(usbd_device *dev, uint8_t ep)
 static void usbuart_run(void)
 {
 	nvic_disable_irq(USB_IRQ);
+
+	// if (dwt_read_cycle_counter() - lastCycCnt >= 30000) {
+		// if ((*USB_EP_REG(CDCACM_UART_ENDPOINT) & USB_EP_TX_STAT) == USB_EP_TX_STAT_VALID) {
+			// canTX++;
+		// }
+	// }
 
 	/* Try to send a packet if usb is idle */
 	if (rx_usb_trfr_cplt)
@@ -305,8 +325,8 @@ void USBUSART_DMA_TX_ISR(void)
 	}
 	else
 	{
-		tx_trfr_cplt = true;
 		gpio_clear(LED_PORT_UART, LED_UART);
+		tx_trfr_cplt = true;
 	}
 	
 	nvic_enable_irq(USB_IRQ);
